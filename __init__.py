@@ -1,23 +1,68 @@
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.stem import PorterStemmer
+import time
+from sklearn.metrics.pairwise import linear_kernel
 
-class RecommendPosts:
-    def __init__(self, postsCollection, similarityModule) -> None:
-        self.postsCollection = postsCollection
-        self.similarityModule = similarityModule
+# importing mongodb module
 
-    def findSimilar(self, queryPostUrl, totalResults=10, usePoints=True, cap=True):
-        queryPost = dict(self.postsCollection.find_one({'urlEndPoint':queryPostUrl}))
-        content = queryPost['title'] + ' ' + queryPost['media']
-        # getting the content to search 
+class RecommendPost:
+    def __init__(self, collection, projection:dir={}, sortMethod=-1, likeWeight=0.63, commentWeight=1.32, shareWeight=2.7, similarityWeight=1e2, powerWeight=53, vocabularyFile="customWordList.txt") -> None:
+        self.collection = collection
+        # initializing the collection 
 
-        posts = list((self.postsCollection.find({'$text':{'$search':content}}).sort('points', -1)))
+        self.projection = projection
+        self.sortMethod = sortMethod
+        # initializing all the query filters 
+
+        self.likeWeight = likeWeight
+        self.commentWeight = commentWeight
+        self.similarityWeight = similarityWeight
+        self.powerWeight = powerWeight
+        self.shareWeight = shareWeight
+        self.stemmer = PorterStemmer()
+        # initializing the weights 
+
+        with open(vocabularyFile, 'r') as file:
+            words = file.read()
+        self.tfidfVectorizer = TfidfVectorizer()
+        self.tfidfVectorizer.fit([words])
+        # initializing the vectorizer 
+
+    def calculatePower(self, data:pd.DataFrame):
+        nonNormalizedPower = (data['points']*self.likeWeight) + (data['comments']*self.commentWeight) + (data['shares']*self.shareWeight)
+        return nonNormalizedPower / data['points'].max()
+
+    def score(self, data:pd.DataFrame):
+        return (data['similarity'] * self.similarityWeight) + (data['power'] * self.powerWeight)
+
+    def similar(self, data:pd.DataFrame, contentVector, queryVector):
+        data['similarity'] = linear_kernel(contentVector, queryVector)
+        data['score'] = self.score(data)
+        data = data.sort_values('score', ascending=False)
         
-        if len(posts) >= 3070:
-            posts = posts[:3070]
-        # getting all the posts, stripping if its too long
+        return data
 
-        if queryPost not in posts:
-            posts.append(queryPost)
-        # appending the query if its not in the posts list for some reason 
+    def similarPost(self, url, returnUrlOnly=True, topN=True, top=100, **kwargs):
+        postContent = dict(self.collection.find_one({'urlEndPoint':url}, projection={"title":True, "media":True, "_id":False}))
+        postContent = postContent['title'] + " " + postContent['media']
+        # getting the content of the post  
+        
+        data = pd.DataFrame(list(self.collection.find({'$text':{'$search':postContent},}, projection=self.projection, sort=[('points',-1)],limit=3070)))
+        # getting the data 
 
-        return self.similarityModule.findSimilarPosts(pd.DataFrame(posts), queryPostUrl, totalResults, usePoints, cap)
+        
+
+        data['power'] = self.calculatePower(data)
+        # calculating the power 
+
+        
+        contentVector = self.tfidfVectorizer.transform(data['title'] + " " + data['media'])        
+        queryVector = self.tfidfVectorizer.transform([postContent])
+        # getting the index of the query and creating vector for content and query         
+        
+        data = self.similar(data, contentVector, queryVector)[1:top+1] if topN else self.similar(data, contentVector, queryVector)[1:]
+        # finding similar 
+               
+        return data['urlEndPoint'] if returnUrlOnly else data
+
